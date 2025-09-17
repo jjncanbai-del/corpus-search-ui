@@ -18,8 +18,8 @@ LLM_API_KEY  = st.secrets.get("LLM_API_KEY", os.getenv("LLM_API_KEY", ""))
 LLM_MODEL    = st.secrets.get("LLM_MODEL", os.getenv("LLM_MODEL", "meta-llama/Meta-Llama-3.1-8B-Instruct"))
 
 st.set_page_config(page_title="Corpus Agent", page_icon="🔎", layout="wide")
-st.title("🔎 Corpus Agent (Qdrant + e5-small + LLM)")
-st.caption("Grounded search & Q&A for your Indonesia terrorism corpus. English & Bahasa Indonesia.")
+st.title("🔎 Indonesia Terrorism Researcher")
+st.caption("Understanding terrorism in Indonesia, based on verified, selected sources. English & Bahasa Indonesia.")
 
 # =========================
 # Cached resources
