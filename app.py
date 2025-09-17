@@ -1,9 +1,9 @@
 import os
-import textwrap
 import requests
 import streamlit as st
 from sentence_transformers import SentenceTransformer
 from qdrant_client import QdrantClient
+from qdrant_client.http import models as qm
 
 # =========================
 # Config (from Secrets/env)
@@ -65,16 +65,36 @@ def rerank(query: str, points, keep: int = 12):
 # =========================
 # Retrieval utilities
 # =========================
-def search_points(query: str, top_k: int):
-    qvec = embed_model.encode([query], normalize_embeddings=True, truncate=True)[0].tolist()
-    res = client.search(collection_name=COLLECTION, query_vector=qvec, limit=top_k, with_payload=True)
-    return res
+def search_points(query: str, top_k: int, *, candidates: int = None, exact: bool = False, hnsw_ef: int = 256):
+    """
+    Retrieve candidates from Qdrant.
+    - candidates: how many items to fetch BEFORE reranking/keeping top_k
+    - exact=True: exhaustive (brute-force) scoring for maximum recall (slower but thorough)
+    - hnsw_ef: raise to increase ANN recall when exact=False
+    """
+    pool = max(top_k, candidates or top_k)
+    qvec = embed_model.encode([f"query: {query}"], normalize_embeddings=True, truncate=True)[0].tolist()
+    return client.search(
+        collection_name=COLLECTION,
+        query_vector=qvec,
+        limit=pool,
+        with_payload=True,
+        search_params=qm.SearchParams(exact=exact, hnsw_ef=hnsw_ef),
+    )
 
-def build_context(points, max_chars=9000):
-    """
-    Turn top points into context with inline citation tags [S1], [S2]...
-    Returns (context_text, citations_list)
-    """
+def diversify_by_source(points, per_source_max=3):
+    """Limit how many results come from the same source to broaden coverage."""
+    used = {}
+    out = []
+    for p in points:
+        src = (p.payload or {}).get("source", "unknown")
+        used[src] = used.get(src, 0) + 1
+        if used[src] <= per_source_max:
+            out.append(p)
+    return out
+
+def build_context(points, max_chars=12000):
+    """Turn top points into context with inline citation tags [S1], [S2]..."""
     contexts, citations = [], []
     total = 0
     for i, p in enumerate(points, 1):
@@ -83,7 +103,7 @@ def build_context(points, max_chars=9000):
         src = pay.get("source", "unknown")
         pages = f"{pay.get('page_start','?')}-{pay.get('page_end','?')}"
         txt = (pay.get("text","") or "").strip()
-        snippet = txt[:1500]  # keep each snippet compact
+        snippet = txt[:1500]
         block = f"[{tag}] {snippet}"
         if total + len(block) > max_chars:
             break
@@ -109,7 +129,6 @@ def make_prompt(question: str, context: str, detail: str = "narrative"):
             "If there are uncertainties or conflicting evidence, acknowledge them briefly."
         ),
     }
-
     system = (
         "You are a careful research assistant. Use ONLY the provided context. "
         "Cite sources inline using [S1], [S2], etc after claims. "
@@ -131,16 +150,14 @@ def call_llm(system: str, user: str, *, max_tokens: int = 1600, temperature: flo
     if "openrouter.ai" in LLM_BASE_URL:
         headers["HTTP-Referer"] = "https://your-streamlit-app-url.example"
         headers["X-Title"] = "Corpus Agent"
-
     payload = {
         "model": LLM_MODEL,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": temperature,   # a bit more creative
-        "top_p": 0.95,                # smoother sampling
-        "max_tokens": max_tokens,     # allow longer answers
+        "temperature": temperature,
+        "top_p": 0.95,
+        "max_tokens": max_tokens,
     }
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
-    import requests
     r = requests.post(url, headers=headers, json=payload, timeout=90)
     r.raise_for_status()
     data = r.json()
@@ -157,9 +174,16 @@ with tab1:
         st.markdown("**Collection:** `%s`" % COLLECTION)
     q = st.text_input("Search query", placeholder="e.g., perkembangan rekrutmen JAD 2016–2020 di Indonesia")
     top_k = st.slider("Top-K", 1, 20, TOP_K_DEFAULT, 1, key="search_k")
+    high_recall = st.toggle("High recall (search)", value=False, help="Fetch wider pool; exhaustive when on.")
     if st.button("Search", type="primary") and q:
         with st.spinner("Searching..."):
-            results = search_points(q, top_k)
+            results = search_points(
+                q,
+                top_k,
+                candidates=max(50, top_k) if high_recall else None,
+                exact=high_recall,
+                hnsw_ef=512 if not high_recall else 128,
+            )
         if not results:
             st.info("No results found.")
         else:
@@ -182,28 +206,41 @@ with tab2:
 
     colA, colB, colC = st.columns(3)
     with colA:
-        top_k_qna = st.slider("Evidence passages (Top-K)", 5, 20, 12, 1)
+        top_k_qna = st.slider("Evidence passages (Top-K)", 5, 20, 16, 1)          # ↑ default
     with colB:
-        ctx_chars = st.slider("Context size (chars)", 3000, 20000, 9000, 1000)
+        ctx_chars = st.slider("Context size (chars)", 3000, 20000, 12000, 1000)   # ↑ default
     with colC:
-        max_toks = st.slider("Max answer tokens", 256, 2400, 1200, 64)
+        max_toks = st.slider("Max answer tokens", 256, 3000, 1600, 64)            # ↑ default
 
-    detail = st.selectbox("Answer depth", ["deep", "normal", "brief"], index=0)
+    colD, colE = st.columns(2)
+    with colD:
+        tone = st.selectbox("Answer style", ["narrative", "normal", "brief"], index=0)
+    with colE:
+        high_recall_qna = st.toggle("High recall (Q&A)", value=False, help="Fetch a wider pool; exhaustive when on.")
 
     if st.button("Answer", type="primary") and q2:
         with st.spinner("Retrieving evidence..."):
-            # fetch more than we need; we’ll keep the top_k_qna after context build if you add reranking later
-            points = search_points(q2, max(20, top_k_qna))
+            candidates = search_points(
+                q2,
+                top_k_qna,
+                candidates=100 if high_recall_qna else 50,  # widen pool
+                exact=high_recall_qna,                      # exhaustive when toggled
+                hnsw_ef=512 if not high_recall_qna else 128,
+            )
+            candidates = diversify_by_source(candidates, per_source_max=3)
+            points = rerank(q2, candidates, keep=top_k_qna)
+
         if not points:
             st.info("No evidence found in the index.")
         else:
             context, cites = build_context(points, max_chars=ctx_chars)
             try:
-                sys_msg, user_msg = make_prompt(q2, context, detail=detail)
+                sys_msg, user_msg = make_prompt(q2, context, detail=tone)
                 with st.spinner("Writing grounded answer..."):
-                    answer = call_llm(sys_msg, user_msg, max_tokens=max_toks, temperature=0.2)
+                    answer = call_llm(sys_msg, user_msg, max_tokens=max_toks, temperature=0.5)
                 st.markdown("### Answer")
                 st.write(answer)
+                st.caption(f"Candidates considered: {len(candidates)} | Final used: {len(points)}")
                 st.markdown("##### Sources")
                 for c in cites[:top_k_qna]:
                     st.markdown("- " + c)
