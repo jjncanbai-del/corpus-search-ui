@@ -92,17 +92,24 @@ def build_context(points, max_chars=9000):
         total += len(block)
     return "\n\n".join(contexts), citations
 
-def make_prompt(question: str, context: str, detail: str = "deep"):
+def make_prompt(question: str, context: str, detail: str = "narrative"):
     """
-    detail: 'brief' | 'normal' | 'deep'
+    detail: 'narrative' | 'normal' | 'brief'
     """
     styles = {
-        "brief":  "Write 3–5 sentences.",
-        "normal": "Write 2–3 short paragraphs with citations.",
-        "deep":   ("Write 4–6 short paragraphs with citations. Use this structure:\n"
-                   "1) Overview\n2) Key developments/drivers\n3) Key actors & relationships\n"
-                   "4) Timeline (brief chronological bullets)\n5) Gaps/uncertainties and caveats.")
+        "brief": (
+            "Write a short paragraph (4–6 sentences)."
+        ),
+        "normal": (
+            "Write 2–3 paragraphs in clear prose. Include inline citations like [S1] at the end of sentences they support."
+        ),
+        "narrative": (
+            "Write 3–6 flowing paragraphs in natural, narrative prose. Avoid headings and bullet points. "
+            "Weave evidence smoothly into the story. Place citations like [S1], [S2] at the end of the sentences they support. "
+            "If there are uncertainties or conflicting evidence, acknowledge them briefly."
+        ),
     }
+
     system = (
         "You are a careful research assistant. Use ONLY the provided context. "
         "Cite sources inline using [S1], [S2], etc after claims. "
@@ -111,24 +118,26 @@ def make_prompt(question: str, context: str, detail: str = "deep"):
     user = (
         f"Question:\n{question}\n\n"
         f"Context (snippets with tags):\n{context}\n\n"
-        f"Instructions:\n- {styles.get(detail, styles['deep'])}\n"
+        f"Instructions:\n- {styles.get(detail, styles['narrative'])}\n"
         f"- Keep claims tied to the snippets and include [S#] after the relevant sentences.\n"
-        f"- Prefer concise, factual prose. Use bullets only where helpful."
+        f"- Prefer cohesive, natural language. Avoid lists unless absolutely necessary."
     )
     return system, user
 
-def call_llm(system: str, user: str, *, max_tokens: int = 1200, temperature: float = 0.2):
+def call_llm(system: str, user: str, *, max_tokens: int = 1600, temperature: float = 0.5):
     if not (LLM_BASE_URL and LLM_API_KEY and LLM_MODEL):
         raise RuntimeError("LLM settings missing. Add LLM_BASE_URL, LLM_API_KEY, LLM_MODEL in Secrets.")
     headers = {"Authorization": f"Bearer {LLM_API_KEY}", "Content-Type": "application/json"}
     if "openrouter.ai" in LLM_BASE_URL:
         headers["HTTP-Referer"] = "https://your-streamlit-app-url.example"
         headers["X-Title"] = "Corpus Agent"
+
     payload = {
         "model": LLM_MODEL,
         "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": temperature,
-        "max_tokens": max_tokens,
+        "temperature": temperature,   # a bit more creative
+        "top_p": 0.95,                # smoother sampling
+        "max_tokens": max_tokens,     # allow longer answers
     }
     url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
     import requests
