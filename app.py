@@ -39,6 +39,30 @@ embed_model = get_embed_model()
 client = get_qdrant()
 
 # =========================
+# --- Reranker (cross-encoder) ---
+# =========================
+@st.cache_resource(show_spinner=True)
+def get_reranker():
+    try:
+        from FlagEmbedding import FlagReranker
+        import torch
+        use_fp16 = torch.cuda.is_available()  # fp16 if GPU; falls back on CPU
+        return FlagReranker("BAAI/bge-reranker-v2-m3", use_fp16=use_fp16)
+    except Exception as e:
+        st.warning(f"Reranker unavailable ({e}). Using vector search only.")
+        return None
+
+def rerank(query: str, points, keep: int = 12):
+    """Reorder retrieved points by cross-encoder score, keep top N."""
+    rr = get_reranker()
+    if rr is None or not points:
+        return points[:keep]
+    pairs = [(f"query: {query}", (p.payload or {}).get("text", "")) for p in points]
+    scores = rr.compute_score(pairs, normalize=True)  # higher = better
+    ranked = [p for _, p in sorted(zip(scores, points), key=lambda x: x[0], reverse=True)]
+    return ranked[:keep]
+
+# =========================
 # Retrieval utilities
 # =========================
 def search_points(query: str, top_k: int):
